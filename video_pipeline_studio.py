@@ -2,221 +2,52 @@
 """
 Video Pipeline Studio
 =====================
-Interactive desktop app (Windows / Mac / Linux) that runs a full
-text-to-video production pipeline on the Gemini API:
+Desktop app (Windows / Mac / Linux) that produces narrated videos end to end.
 
-  1. Topic  -> full script broken into scenes (narration + image prompt
-               + video motion prompt) via Gemini 2.5 Pro
-  2. Scene  -> image        (Gemini image model)
-  3. Scene  -> speech (WAV) (Gemini 2.5 Pro TTS)
-  4. Scene  -> video        (Veo image-to-video, scene image = first frame)
-  5. ffmpeg -> sync each video to its narration length, mux audio,
-               concat everything into final.mp4
+Auth:   Login with Google Cloud (gcloud) — no API key to paste. Pick a project,
+        list & test Gemini models from the API, pick & test a voice.
+Engine: script + images + speech come from Gemini; VIDEO comes from Dola
+        (dola.com) driven in a real Chrome window.
 
-Everything is saved into a local project directory. Failed steps are
-tracked per scene and can be retried / regenerated individually or in
-bulk from the UI.
+Three tabs:
+  1. Setup      — Google Cloud login, project, model list + test, voice + test.
+  2. Pipeline   — topic -> scenes -> images -> speech -> Dola videos -> merge.
+  3. Dola Video — generate video from a single prompt, or a batch of prompts.
 
-Requirements:
-  * Python 3.9+  (Tkinter is included in the standard Windows installer)
-  * ffmpeg + ffprobe on PATH  (https://ffmpeg.org  /  `winget install ffmpeg`)
-  * A Google AI Studio API key (https://aistudio.google.com/apikey)
-
-No third-party Python packages are required - only the standard library.
+Requirements on the machine:
+  * Python 3.9+ with Tkinter (bundled in the Windows installer)
+  * Google Cloud SDK  (the `gcloud` command)      -> https://cloud.google.com/sdk
+  * ffmpeg + ffprobe on PATH                       -> winget install ffmpeg
+  * pip install playwright   (first Dola run auto-downloads the browser)
 """
-
-import base64
-import json
-import os
-import queue
-import re
-import shutil
-import struct
-import subprocess
-import sys
-import threading
-import time
-import traceback
-import urllib.error
-import urllib.request
-import wave
+import json, os, queue, shutil, subprocess, sys, threading, time, traceback
 from pathlib import Path
-
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
-API_BASE = "https://generativelanguage.googleapis.com"
-CURRENT_VERSION = "1.0.0"
-UPDATE_URL = "https://example.com/version.json" # Change this! Expected format: {"version": "1.0.1", "url": "https://..."}
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import gclient
+import updater
+from dola import DolaSession
 
-DEFAULTS = {
-    "script_model": "gemini-2.5-pro",
-    "image_model": "gemini-2.5-flash-image",
-    "tts_model": "gemini-2.5-pro-preview-tts",
-    "video_model": "veo-3.0-generate-001",
-    "voice": "Kore",
-    "aspect_ratio": "16:9",
-    "num_scenes": "6",
-    "style": "cinematic, photorealistic, dramatic lighting, high detail",
-}
-
-TTS_VOICES = ["Kore", "Puck", "Charon", "Fenrir", "Aoede", "Leda", "Orus",
-              "Zephyr", "Autonoe", "Callirrhoe", "Enceladus", "Iapetus"]
-
+STYLE_DEFAULT = "cinematic, photorealistic, dramatic lighting, high detail"
 SCRIPT_PROMPT = """You are a professional video director and screenwriter.
 Write a video script about the topic below, split into exactly {n} scenes.
 
 Topic: {topic}
+Visual style: {style}
 
-Visual style for the whole video: {style}
-
-Return ONLY valid JSON matching this schema:
-{{
-  "title": "...",
-  "scenes": [
-    {{
-      "narration": "2-4 spoken sentences of voiceover for this scene",
-      "image_prompt": "A richly detailed prompt for a text-to-image model describing the KEY FRAME of this scene. Include subject, composition, camera angle, lens, lighting, mood, color palette, and the style '{style}'. No text/captions in the image.",
-      "video_prompt": "A prompt for an image-to-video model that animates that exact frame: describe camera motion (dolly/pan/zoom), subject movement, atmosphere, pacing. Keep visual continuity with the image."
-    }}
-  ]
-}}
-Scenes must flow as one continuous story. Narration must sound natural when read aloud."""
+Return ONLY valid JSON:
+{{"title":"...","scenes":[
+ {{"narration":"2-4 spoken sentences of voiceover",
+   "image_prompt":"detailed key-frame prompt (subject, composition, camera, lighting, mood, style '{style}'); no text in image",
+   "video_prompt":"prompt for an AI video tool animating that scene: camera motion, subject movement, atmosphere, pacing"}}
+]}}
+Scenes must flow as one continuous story; narration must sound natural aloud."""
 
 
-# --------------------------------------------------------------------------
-# Gemini REST client (stdlib only)
-# --------------------------------------------------------------------------
-
-class GeminiClient:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-
-    def _request(self, method: str, url: str, payload=None, timeout=300):
-        data = json.dumps(payload).encode() if payload is not None else None
-        req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("x-goog-api-key", self.api_key)
-        if data is not None:
-            req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")
-            raise RuntimeError(f"HTTP {e.code}: {body[:800]}") from None
-
-    def post(self, path: str, payload: dict, timeout=300) -> dict:
-        return self._request("POST", f"{API_BASE}{path}", payload, timeout)
-
-    def get(self, path: str, timeout=60) -> dict:
-        return self._request("GET", f"{API_BASE}{path}", None, timeout)
-
-    def download(self, url: str, dest: Path):
-        req = urllib.request.Request(url)
-        req.add_header("x-goog-api-key", self.api_key)
-        with urllib.request.urlopen(req, timeout=600) as resp, open(dest, "wb") as f:
-            shutil.copyfileobj(resp, f)
-
-    # ---- pipeline calls ---------------------------------------------------
-
-    def generate_script(self, model, topic, n_scenes, style) -> dict:
-        payload = {
-            "contents": [{"parts": [{"text": SCRIPT_PROMPT.format(
-                topic=topic, n=n_scenes, style=style)}]}],
-            "generationConfig": {"responseMimeType": "application/json",
-                                 "temperature": 0.9},
-        }
-        resp = self.post(f"/v1beta/models/{model}:generateContent", payload)
-        text = resp["candidates"][0]["content"]["parts"][0]["text"]
-        # tolerate accidental markdown fences
-        text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.M).strip()
-        data = json.loads(text)
-        if not data.get("scenes"):
-            raise RuntimeError("Model returned no scenes")
-        return data
-
-    def generate_image(self, model, prompt, dest: Path):
-        payload = {"contents": [{"parts": [{"text": prompt}]}],
-                   "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]}}
-        resp = self.post(f"/v1beta/models/{model}:generateContent", payload)
-        for cand in resp.get("candidates", []):
-            for part in cand.get("content", {}).get("parts", []):
-                inline = part.get("inlineData") or part.get("inline_data")
-                if inline and inline.get("mimeType", "").startswith("image"):
-                    dest.write_bytes(base64.b64decode(inline["data"]))
-                    return
-        raise RuntimeError(f"No image in response: {json.dumps(resp)[:400]}")
-
-    def generate_tts(self, model, voice, text, dest: Path):
-        payload = {
-            "contents": [{"parts": [{"text": text}]}],
-            "generationConfig": {
-                "responseModalities": ["AUDIO"],
-                "speechConfig": {"voiceConfig": {
-                    "prebuiltVoiceConfig": {"voiceName": voice}}},
-            },
-        }
-        resp = self.post(f"/v1beta/models/{model}:generateContent", payload)
-        part = resp["candidates"][0]["content"]["parts"][0]
-        inline = part.get("inlineData") or part.get("inline_data")
-        if not inline:
-            raise RuntimeError(f"No audio in response: {json.dumps(resp)[:400]}")
-        pcm = base64.b64decode(inline["data"])
-        rate = 24000
-        m = re.search(r"rate=(\d+)", inline.get("mimeType", ""))
-        if m:
-            rate = int(m.group(1))
-        with wave.open(str(dest), "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(rate)
-            w.writeframes(pcm)
-
-    def generate_video(self, model, prompt, image_path: Path, aspect,
-                       dest: Path, log=lambda s: None):
-        instance = {"prompt": prompt}
-        if image_path and image_path.exists():
-            instance["image"] = {
-                "bytesBase64Encoded": base64.b64encode(image_path.read_bytes()).decode(),
-                "mimeType": "image/png",
-            }
-        payload = {"instances": [instance],
-                   "parameters": {"aspectRatio": aspect}}
-        resp = self.post(f"/v1beta/models/{model}:predictLongRunning", payload)
-        op_name = resp["name"]
-        log(f"    Veo operation started: {op_name}")
-        deadline = time.time() + 900
-        while time.time() < deadline:
-            time.sleep(10)
-            op = self.get(f"/v1beta/{op_name}")
-            if op.get("error"):
-                raise RuntimeError(f"Veo error: {op['error']}")
-            if op.get("done"):
-                r = op.get("response", {})
-                gvr = r.get("generateVideoResponse", r)
-                samples = (gvr.get("generatedSamples")
-                           or gvr.get("generated_samples")
-                           or gvr.get("videos") or [])
-                if not samples:
-                    raise RuntimeError(f"Veo finished with no video: {json.dumps(r)[:400]}")
-                s = samples[0]
-                video = s.get("video", s)
-                uri = video.get("uri")
-                if uri:
-                    self.download(uri, dest)
-                elif video.get("bytesBase64Encoded"):
-                    dest.write_bytes(base64.b64decode(video["bytesBase64Encoded"]))
-                else:
-                    raise RuntimeError(f"Unrecognized video payload: {json.dumps(s)[:400]}")
-                return
-            log("    ...rendering video")
-        raise RuntimeError("Veo operation timed out after 15 min")
-
-
-# --------------------------------------------------------------------------
-# ffmpeg helpers
-# --------------------------------------------------------------------------
-
+# ----------------------------------------------------------------- ffmpeg
 def run_cmd(args):
     p = subprocess.run(args, capture_output=True, text=True)
     if p.returncode != 0:
@@ -224,50 +55,47 @@ def run_cmd(args):
     return p.stdout
 
 
-def media_duration(path: Path) -> float:
-    out = run_cmd(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                   "-of", "default=noprint_wrappers=1:nokey=1", str(path)])
-    return float(out.strip())
+def media_duration(path):
+    return float(run_cmd(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                          "-of", "default=noprint_wrappers=1:nokey=1", str(path)]).strip())
 
 
-def build_scene_clip(video: Path, audio: Path, dest: Path):
-    """Make one clip whose length == narration length.
-    If the narration is longer than the video, the video loops; if shorter,
-    the video is trimmed. Audio and video always end together."""
+def build_scene_clip(video, audio, dest):
     adur = media_duration(audio)
-    run_cmd([
-        "ffmpeg", "-y",
-        "-stream_loop", "-1", "-i", str(video),
-        "-i", str(audio),
-        "-map", "0:v:0", "-map", "1:a:0",
-        "-t", f"{adur:.3f}",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-r", "24",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-        str(dest),
-    ])
+    run_cmd(["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(video), "-i", str(audio),
+             "-map", "0:v:0", "-map", "1:a:0", "-t", f"{adur:.3f}",
+             "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+             "-r", "24", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", str(dest)])
 
 
-def concat_clips(clips, dest: Path, workdir: Path):
-    lst = workdir / "concat.txt"
-    lst.write_text("".join(f"file '{c.as_posix()}'\n" for c in clips))
+def concat_clips(clips, dest, workdir):
+    lst = Path(workdir) / "concat.txt"
+    lst.write_text("".join(f"file '{Path(c).as_posix()}'\n" for c in clips))
     run_cmd(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-             "-movflags", "+faststart", str(dest)])
+             "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(dest)])
 
 
-# --------------------------------------------------------------------------
-# Project state
-# --------------------------------------------------------------------------
+def play_wav(path):
+    try:
+        if sys.platform == "win32":
+            import winsound
+            winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["afplay", str(path)])
+        else:
+            subprocess.Popen(["aplay", str(path)], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
 
 STEPS = ("image", "audio", "video")
 
 
 class Project:
-    def __init__(self, root: Path):
-        self.root = root
-        self.file = root / "project.json"
+    def __init__(self, root):
+        self.root = Path(root)
+        self.file = self.root / "project.json"
         self.data = {"topic": "", "title": "", "scenes": []}
 
     def load(self):
@@ -276,576 +104,540 @@ class Project:
 
     def save(self):
         self.root.mkdir(parents=True, exist_ok=True)
-        self.file.write_text(json.dumps(self.data, indent=2, ensure_ascii=False),
-                             encoding="utf-8")
+        self.file.write_text(json.dumps(self.data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def scene_paths(self, i):
-        s = self.root / "scenes"
-        s.mkdir(parents=True, exist_ok=True)
-        return {"image": s / f"scene_{i+1:02d}.png",
-                "audio": s / f"scene_{i+1:02d}.wav",
-                "video": s / f"scene_{i+1:02d}.mp4",
-                "clip": s / f"scene_{i+1:02d}_final.mp4"}
+        s = self.root / "scenes"; s.mkdir(parents=True, exist_ok=True)
+        return {"image": s / f"scene_{i+1:02d}.png", "audio": s / f"scene_{i+1:02d}.wav",
+                "video": s / f"scene_{i+1:02d}.mp4", "clip": s / f"scene_{i+1:02d}_final.mp4"}
 
 
-# --------------------------------------------------------------------------
-# UI
-# --------------------------------------------------------------------------
-
+# ----------------------------------------------------------------- UI
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Video Pipeline Studio")
-        self.geometry("1180x780")
-        self.minsize(980, 640)
-
+        self.title(f"Video Pipeline Studio  v{updater.VERSION}")
+        self.geometry("1180x820"); self.minsize(1000, 680)
         self.project = None
         self.worker = None
         self.stop_flag = threading.Event()
         self.msg_q = queue.Queue()
+        self.dola = None          # shared DolaSession (opened lazily)
+        self.gc = None            # gclient.Gemini once project chosen
 
-        self._build_ui()
-        self.after(100, self._poll_queue)
-        self.after(1000, lambda: self._run_bg(self._check_for_updates))
+        self.v = {
+            "project": tk.StringVar(),
+            "region": tk.StringVar(value="us-central1"),
+            "text_model": tk.StringVar(value="gemini-2.5-pro"),
+            "image_model": tk.StringVar(value="gemini-2.5-flash-image"),
+            "tts_model": tk.StringVar(value="gemini-2.5-pro-preview-tts"),
+            "voice": tk.StringVar(value="Kore"),
+            "topic": tk.StringVar(),
+            "scenes": tk.StringVar(value="6"),
+            "style": tk.StringVar(value=STYLE_DEFAULT),
+            "out_dir": tk.StringVar(value=str(Path.home() / "VideoPipelineProjects" / "project1")),
+            "account": tk.StringVar(value="not logged in"),
+            "dola_dir": tk.StringVar(value=str(Path.home() / "VideoPipelineProjects" / "dola")),
+            "dola_prompt": tk.StringVar(value="A cinematic drone shot through a neon-lit cyber city at dusk, 8k"),
+        }
+        self._build()
+        self.after(120, self._poll)
+        self._bg(self._refresh_account)
 
-    # ---- layout -----------------------------------------------------------
+    # ---- layout ----------------------------------------------------------
+    def _build(self):
+        nb = ttk.Notebook(self); nb.pack(fill="both", expand=True, padx=6, pady=6)
+        self.tab_setup = ttk.Frame(nb); self.tab_pipe = ttk.Frame(nb); self.tab_dola = ttk.Frame(nb)
+        nb.add(self.tab_setup, text="1 · Setup / Auth")
+        nb.add(self.tab_pipe, text="2 · Pipeline")
+        nb.add(self.tab_dola, text="3 · Dola Video")
+        self._build_setup(); self._build_pipe(); self._build_dola()
 
-    def _build_ui(self):
-        pad = {"padx": 6, "pady": 3}
+        self.progress = ttk.Progressbar(self, mode="determinate")
+        self.progress.pack(fill="x", padx=8)
+        self.log_box = scrolledtext.ScrolledText(self, height=9, state="disabled", font=("Consolas", 9))
+        self.log_box.pack(fill="both", padx=8, pady=6)
 
-        top = ttk.LabelFrame(self, text="Settings")
-        top.pack(fill="x", padx=8, pady=6)
+    def _build_setup(self, pad={"padx": 6, "pady": 4}):
+        f = self.tab_setup
+        a = ttk.LabelFrame(f, text="Google Cloud"); a.pack(fill="x", padx=8, pady=6)
+        r = ttk.Frame(a); r.pack(fill="x")
+        ttk.Button(r, text="Login with Google Cloud", command=lambda: self._bg(self._login)).pack(side="left", **pad)
+        ttk.Button(r, text="Logout", command=lambda: self._bg(self._logout)).pack(side="left", **pad)
+        ttk.Label(r, text="Account:").pack(side="left", **pad)
+        ttk.Label(r, textvariable=self.v["account"], foreground="#2c7").pack(side="left", **pad)
+        ttk.Button(r, text="Check for updates", command=lambda: self._bg(self._check_update)).pack(side="right", **pad)
+        r2 = ttk.Frame(a); r2.pack(fill="x")
+        ttk.Label(r2, text="Project:").pack(side="left", **pad)
+        self.project_cb = ttk.Combobox(r2, textvariable=self.v["project"], width=34)
+        self.project_cb.pack(side="left", **pad)
+        ttk.Button(r2, text="Load projects", command=lambda: self._bg(self._load_projects)).pack(side="left", **pad)
+        ttk.Label(r2, text="Region:").pack(side="left", **pad)
+        ttk.Combobox(r2, textvariable=self.v["region"], values=gclient.REGIONS, width=14).pack(side="left", **pad)
 
-        self.api_key = tk.StringVar(value=os.environ.get("GEMINI_API_KEY", ""))
-        self.out_dir = tk.StringVar(value=str(Path.home() / "VideoPipelineProjects" / "project1"))
-        self.topic = tk.StringVar()
-        self.vars = {k: tk.StringVar(value=v) for k, v in DEFAULTS.items()}
+        m = ttk.LabelFrame(f, text="Models  (from the API — pick and Test each)"); m.pack(fill="x", padx=8, pady=6)
+        ttk.Button(m, text="List models from API", command=lambda: self._bg(self._list_models)).pack(anchor="w", **pad)
+        self.model_cbs = {}
+        for key, label in (("text_model", "Script model"), ("image_model", "Image model"),
+                           ("tts_model", "Speech (TTS) model")):
+            row = ttk.Frame(m); row.pack(fill="x")
+            ttk.Label(row, text=label + ":", width=18).pack(side="left", **pad)
+            cb = ttk.Combobox(row, textvariable=self.v[key], width=34); cb.pack(side="left", **pad)
+            self.model_cbs[key] = cb
+            ttk.Button(row, text="Test", command=lambda k=key: self._bg(self._test_model, k)).pack(side="left", **pad)
 
-        r1 = ttk.Frame(top); r1.pack(fill="x")
-        ttk.Label(r1, text="Gemini API key:").pack(side="left", **pad)
-        ttk.Entry(r1, textvariable=self.api_key, show="*", width=42).pack(side="left", **pad)
-        ttk.Label(r1, text="Project folder:").pack(side="left", **pad)
-        ttk.Entry(r1, textvariable=self.out_dir, width=48).pack(side="left", fill="x", expand=True, **pad)
-        ttk.Button(r1, text="Browse…", command=self._browse).pack(side="left", **pad)
+        vf = ttk.LabelFrame(f, text="Voice"); vf.pack(fill="x", padx=8, pady=6)
+        row = ttk.Frame(vf); row.pack(fill="x")
+        ttk.Label(row, text="Voice:", width=18).pack(side="left", **pad)
+        self.voice_cb = ttk.Combobox(row, textvariable=self.v["voice"], values=gclient.VOICES, width=20)
+        self.voice_cb.pack(side="left", **pad)
+        ttk.Button(row, text="Test voice ▶", command=lambda: self._bg(self._test_voice)).pack(side="left", **pad)
 
-        r2 = ttk.Frame(top); r2.pack(fill="x")
-        ttk.Label(r2, text="Topic / idea:").pack(side="left", **pad)
-        ttk.Entry(r2, textvariable=self.topic).pack(side="left", fill="x", expand=True, **pad)
+    def _build_pipe(self, pad={"padx": 6, "pady": 4}):
+        f = self.tab_pipe
+        top = ttk.Frame(f); top.pack(fill="x", padx=8, pady=6)
+        ttk.Label(top, text="Project folder:").pack(side="left", **pad)
+        ttk.Entry(top, textvariable=self.v["out_dir"], width=48).pack(side="left", fill="x", expand=True, **pad)
+        ttk.Button(top, text="Browse…", command=self._browse).pack(side="left", **pad)
+        ttk.Button(top, text="Load", command=self._load_project).pack(side="left", **pad)
+        r2 = ttk.Frame(f); r2.pack(fill="x", padx=8)
+        ttk.Label(r2, text="Topic:").pack(side="left", **pad)
+        ttk.Entry(r2, textvariable=self.v["topic"]).pack(side="left", fill="x", expand=True, **pad)
         ttk.Label(r2, text="Scenes:").pack(side="left", **pad)
-        ttk.Spinbox(r2, from_=1, to=30, textvariable=self.vars["num_scenes"], width=4).pack(side="left", **pad)
-
-        r3 = ttk.Frame(top); r3.pack(fill="x")
+        ttk.Spinbox(r2, from_=1, to=30, textvariable=self.v["scenes"], width=4).pack(side="left", **pad)
+        r3 = ttk.Frame(f); r3.pack(fill="x", padx=8)
         ttk.Label(r3, text="Style:").pack(side="left", **pad)
-        ttk.Entry(r3, textvariable=self.vars["style"], width=52).pack(side="left", **pad)
-        ttk.Label(r3, text="Voice:").pack(side="left", **pad)
-        ttk.Combobox(r3, textvariable=self.vars["voice"], values=TTS_VOICES, width=12).pack(side="left", **pad)
-        ttk.Label(r3, text="Aspect:").pack(side="left", **pad)
-        ttk.Combobox(r3, textvariable=self.vars["aspect_ratio"], values=["16:9", "9:16"], width=6).pack(side="left", **pad)
+        ttk.Entry(r3, textvariable=self.v["style"], width=70).pack(side="left", **pad)
 
-        r4 = ttk.Frame(top); r4.pack(fill="x")
-        for label, key, width in (("Script model:", "script_model", 18),
-                                  ("Image model:", "image_model", 24),
-                                  ("TTS model:", "tts_model", 26),
-                                  ("Video model:", "video_model", 22)):
-            ttk.Label(r4, text=label).pack(side="left", **pad)
-            if key == "video_model":
-                ttk.Combobox(r4, textvariable=self.vars[key], values=["veo-3.0-generate-001", "dola"], width=width).pack(side="left", **pad)
-            else:
-                ttk.Entry(r4, textvariable=self.vars[key], width=width).pack(side="left", **pad)
+        btns = ttk.Frame(f); btns.pack(fill="x", padx=8, pady=4)
+        for text, cmd in (("1 Script", self.act_script), ("2 Images", lambda: self.act_step("image")),
+                          ("3 Speech", lambda: self.act_step("audio")),
+                          ("4 Videos (Dola)", lambda: self.act_step("video")),
+                          ("5 Merge", self.act_merge), ("▶ Run all", self.act_full),
+                          ("⟳ Retry failed", self.act_retry)):
+            ttk.Button(btns, text=text, command=cmd).pack(side="left", padx=3)
+        ttk.Button(btns, text="■ Stop", command=self.stop_flag.set).pack(side="left", padx=3)
 
-        r5 = ttk.Frame(top); r5.pack(fill="x", pady=(2, 0))
-        ttk.Label(r5, text="Dola Accounts:\n(email:pass:totp)").pack(side="left", anchor="n", **pad)
-        self.dola_accounts_box = scrolledtext.ScrolledText(r5, height=3, width=80)
-        self.dola_accounts_box.pack(side="left", fill="x", expand=True, **pad)
-        try:
-            accs = Path("/home/azureuser/bulk-Video-generation/app/accounts.txt").read_text()
-            self.dola_accounts_box.insert("1.0", accs)
-        except Exception:
-            pass
-
-        # buttons
-        btns = ttk.Frame(self); btns.pack(fill="x", padx=8)
-        self.buttons = {}
-        for text, cmd in (
-            ("1. Generate Script", self.act_script),
-            ("2. Generate Images", lambda: self.act_step("image")),
-            ("3. Generate Speech", lambda: self.act_step("audio")),
-            ("4. Generate Videos", lambda: self.act_step("video")),
-            ("5. Merge Final Video", self.act_merge),
-            ("▶ Run Full Pipeline", self.act_full),
-            ("⟳ Retry Failed", self.act_retry),
-        ):
-            b = ttk.Button(btns, text=text, command=cmd)
-            b.pack(side="left", padx=4, pady=6)
-            self.buttons[text] = b
-        ttk.Button(btns, text="■ Stop", command=self.stop_flag.set).pack(side="left", padx=4)
-        ttk.Button(btns, text="Open Folder", command=self._open_folder).pack(side="right", padx=4)
-        ttk.Button(btns, text="Load Project", command=self.act_load).pack(side="right", padx=4)
-
-        # scene table
-        mid = ttk.Frame(self); mid.pack(fill="both", expand=True, padx=8)
         cols = ("scene", "narration", "image", "audio", "video")
-        self.tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="browse")
-        widths = {"scene": 55, "narration": 560, "image": 90, "audio": 90, "video": 90}
-        for c in cols:
+        self.tree = ttk.Treeview(f, columns=cols, show="headings", height=12)
+        for c, w in (("scene", 55), ("narration", 540), ("image", 90), ("audio", 90), ("video", 100)):
             self.tree.heading(c, text=c.capitalize())
-            self.tree.column(c, width=widths[c], anchor="w" if c == "narration" else "center")
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
-        sb.pack(side="right", fill="y")
-        self.tree.configure(yscrollcommand=sb.set)
+            self.tree.column(c, width=w, anchor="w" if c == "narration" else "center")
+        self.tree.pack(fill="both", expand=True, padx=8, pady=4)
         self.tree.tag_configure("failed", background="#5a2020", foreground="white")
         self.tree.tag_configure("done", background="#1f4d2b", foreground="white")
-
         menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="Regenerate image", command=lambda: self._regen_selected("image"))
-        menu.add_command(label="Regenerate speech", command=lambda: self._regen_selected("audio"))
-        menu.add_command(label="Regenerate video", command=lambda: self._regen_selected("video"))
-        menu.add_separator()
-        menu.add_command(label="Edit prompts / narration", command=self._edit_selected)
-        self.tree.bind("<Button-3>", lambda e: (self.tree.selection_set(
-            self.tree.identify_row(e.y)) if self.tree.identify_row(e.y) else None,
-            menu.tk_popup(e.x_root, e.y_root)))
+        for lbl, st in (("Regenerate image", "image"), ("Regenerate speech", "audio"),
+                        ("Regenerate video", "video")):
+            menu.add_command(label=lbl, command=lambda s=st: self._regen(s))
+        self.tree.bind("<Button-3>", lambda e: (self.tree.selection_set(self.tree.identify_row(e.y))
+                       if self.tree.identify_row(e.y) else None, menu.tk_popup(e.x_root, e.y_root)))
 
-        # progress + log
-        bottom = ttk.Frame(self); bottom.pack(fill="both", padx=8, pady=6)
-        self.progress = ttk.Progressbar(bottom, mode="determinate")
-        self.progress.pack(fill="x", pady=(0, 4))
-        self.log_box = scrolledtext.ScrolledText(bottom, height=9, state="disabled",
-                                                 font=("Consolas", 9))
-        self.log_box.pack(fill="both", expand=True)
+    def _build_dola(self, pad={"padx": 6, "pady": 4}):
+        f = self.tab_dola
+        info = ("Dola makes the video by driving dola.com in a Chrome window. "
+                "Log in once; the session is remembered between runs.")
+        ttk.Label(f, text=info, wraplength=1100, foreground="#89f").pack(anchor="w", padx=10, pady=6)
+        r = ttk.Frame(f); r.pack(fill="x", padx=8)
+        ttk.Button(r, text="Open Dola & log in", command=lambda: self._bg(self._dola_login)).pack(side="left", **pad)
+        ttk.Button(r, text="I'm logged in ✓", command=lambda: self.log("Great — you can generate now.")).pack(side="left", **pad)
+        ttk.Label(r, text="Save to:").pack(side="left", **pad)
+        ttk.Entry(r, textvariable=self.v["dola_dir"], width=44).pack(side="left", **pad)
 
-    # ---- helpers ----------------------------------------------------------
+        single = ttk.LabelFrame(f, text="Single prompt"); single.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(single, textvariable=self.v["dola_prompt"]).pack(fill="x", padx=6, pady=4)
+        ttk.Button(single, text="Generate video", command=lambda: self._bg(self._dola_single)).pack(anchor="w", padx=6, pady=4)
 
-    def log(self, msg):
-        self.msg_q.put(("log", msg))
+        batch = ttk.LabelFrame(f, text="Batch — one prompt per line"); batch.pack(fill="both", expand=True, padx=8, pady=6)
+        self.batch_txt = tk.Text(batch, height=8, wrap="word"); self.batch_txt.pack(fill="both", expand=True, padx=6, pady=4)
+        self.batch_txt.insert("1.0", "A calm sunrise over misty mountains\nWaves crashing on a rocky shore at golden hour\n")
+        ttk.Button(batch, text="Generate all", command=lambda: self._bg(self._dola_batch)).pack(anchor="w", padx=6, pady=4)
 
-    def _poll_queue(self):
+        acc_frame = ttk.LabelFrame(f, text="Dola Accounts (Auto-Login & Delete Flow) [Optional]"); acc_frame.pack(fill="both", expand=True, padx=8, pady=6)
+        ttk.Label(acc_frame, text="Format: email:password:totp_secret (one per line). If provided, these will be used for automated login and generation.").pack(anchor="w", padx=6, pady=2)
+        self.dola_accounts_box = scrolledtext.ScrolledText(acc_frame, height=4, width=80)
+        self.dola_accounts_box.pack(fill="both", expand=True, padx=6, pady=4)
+
+
+    # ---- infra -----------------------------------------------------------
+    def log(self, m): self.msg_q.put(("log", m))
+
+    def _poll(self):
         try:
             while True:
                 kind, payload = self.msg_q.get_nowait()
                 if kind == "log":
                     self.log_box.configure(state="normal")
-                    self.log_box.insert("end", time.strftime("[%H:%M:%S] ") + payload + "\n")
-                    self.log_box.see("end")
-                    self.log_box.configure(state="disabled")
-                elif kind == "refresh":
-                    self._refresh_table()
+                    self.log_box.insert("end", time.strftime("[%H:%M:%S] ") + str(payload) + "\n")
+                    self.log_box.see("end"); self.log_box.configure(state="disabled")
+                elif kind == "refresh": self._refresh_table()
                 elif kind == "progress":
-                    done, total = payload
-                    self.progress["maximum"] = max(total, 1)
-                    self.progress["value"] = done
-                elif kind == "error":
-                    messagebox.showerror("Error", payload)
-                elif kind == "update_ready":
-                    bat_path, ver = payload
-                    if messagebox.askyesno("Update Ready", f"Version {ver} is ready to install. Restart now?"):
-                        subprocess.Popen(bat_path, shell=True)
-                        self.destroy()
-                        sys.exit(0)
-                elif kind == "update_ready_py":
-                    ver = payload
-                    messagebox.showinfo("Update Complete", f"Successfully updated script to {ver}. Please restart the application.")
+                    self.progress["maximum"] = max(payload[1], 1); self.progress["value"] = payload[0]
+                elif kind == "error": messagebox.showerror("Error", payload)
+                elif kind == "login_url": self._open_login_dialog(payload)
+                elif kind == "set": self.v[payload[0]].set(payload[1])
+                elif kind == "models":
+                    for k, cb in self.model_cbs.items():
+                        cb["values"] = payload.get(k.split("_")[0], [])
+                elif kind == "projects": self.project_cb["values"] = payload
         except queue.Empty:
             pass
-        self.after(120, self._poll_queue)
+        self.after(120, self._poll)
 
-    def _check_for_updates(self):
-        try:
-            req = urllib.request.Request(UPDATE_URL)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-            latest_version = data.get("version", CURRENT_VERSION)
-            download_url = data.get("url", "")
-            
-            def parse_v(v): return [int(x) for x in v.split(".") if x.isdigit()]
-            
-            if parse_v(latest_version) > parse_v(CURRENT_VERSION) and download_url:
-                self.log(f"New version {latest_version} is available! Downloading...")
-                self._apply_update(download_url, latest_version)
-        except Exception as e:
-            self.log(f"Auto-update check skipped or failed: {e}")
+    def _bg(self, fn, *args):
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning("Busy", "A job is already running."); return
+        self.stop_flag.clear()
 
-    def _apply_update(self, download_url, latest_version):
-        try:
-            import tempfile
-            is_exe = getattr(sys, 'frozen', False)
-            ext = ".exe" if is_exe else ".py"
-            
-            req = urllib.request.Request(download_url)
-            tmp_path = Path(tempfile.gettempdir()) / f"update_new{ext}"
-            with urllib.request.urlopen(req, timeout=120) as resp, open(tmp_path, "wb") as f:
-                shutil.copyfileobj(resp, f)
-                
-            self.log("Download complete.")
-            
-            if is_exe:
-                bat_path = Path(tempfile.gettempdir()) / "updater.bat"
-                current_exe = Path(sys.executable).resolve()
-                bat_script = f'@echo off\ntimeout /t 2 /nobreak >nul\nmove /y "{tmp_path}" "{current_exe}"\nstart "" "{current_exe}"\ndel "%~f0"\n'
-                bat_path.write_text(bat_script)
-                self.msg_q.put(("update_ready", (str(bat_path), latest_version)))
-            else:
-                current_script = Path(__file__).resolve()
-                shutil.move(tmp_path, current_script)
-                self.msg_q.put(("update_ready_py", latest_version))
-                
-        except Exception as e:
-            self.log(f"Failed to apply update: {e}")
+        def wrap():
+            try: fn(*args)
+            except Exception as e:
+                self.log(f"ERROR: {e}"); self.msg_q.put(("error", str(e))); traceback.print_exc()
+            finally: self.msg_q.put(("refresh", None))
+        self.worker = threading.Thread(target=wrap, daemon=True); self.worker.start()
 
     def _browse(self):
         d = filedialog.askdirectory()
-        if d:
-            self.out_dir.set(d)
-
-    def _open_folder(self):
-        p = self.out_dir.get()
-        if sys.platform == "win32":
-            os.startfile(p)  # noqa
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", p])
-        else:
-            subprocess.Popen(["xdg-open", p])
+        if d: self.v["out_dir"].set(d)
 
     def _client(self):
-        key = self.api_key.get().strip()
-        if not key:
-            raise RuntimeError("Enter your Gemini API key first.")
-        return GeminiClient(key)
+        proj = self.v["project"].get().strip()
+        region = self.v["region"].get().strip() or "us-central1"
+        if not proj:
+            raise RuntimeError("Pick a Google Cloud project on the Setup tab first.")
+        if not self.gc or self.gc.project != proj or self.gc.region != region:
+            self.gc = gclient.Gemini(proj, region)
+        return self.gc
 
-    def _ensure_project(self) -> Project:
-        if self.project is None or str(self.project.root) != self.out_dir.get():
-            self.project = Project(Path(self.out_dir.get()))
-            self.project.load()
+    # ---- self-update -----------------------------------------------------
+    def _check_update(self):
+        self.log(f"Current version v{updater.VERSION}. Checking GitHub for updates…")
+        tag, exe_url, notes = updater.latest_release()
+        if not updater.is_newer(tag):
+            return self.log(f"You're up to date (latest is v{tag}).")
+        if not exe_url:
+            return self.log(f"v{tag} is available but has no .exe asset yet.")
+        if not messagebox.askyesno("Update available",
+                                    f"Version v{tag} is available (you have v{updater.VERSION}).\n\n"
+                                    f"{(notes or '')[:400]}\n\nDownload and install now?"):
+            return self.log("Update skipped.")
+        import tempfile
+        dest = os.path.join(tempfile.gettempdir(), "VideoPipelineStudio_new.exe")
+        self.log(f"Downloading v{tag}…")
+        updater.download(exe_url, dest, progress=lambda g, t: self.msg_q.put(("progress", (g, t))))
+        try:
+            self.log("Downloaded. Restarting into the new version…")
+            updater.apply_and_restart(dest)
+        except RuntimeError as e:
+            self.log(str(e) + f"\nThe new exe was saved to: {dest}")
+
+    # ---- setup actions ---------------------------------------------------
+    def _refresh_account(self):
+        self.msg_q.put(("set", ("account", gclient.account() or "not logged in")))
+
+    def _login(self):
+        self.log("Getting a Google sign-in link (copy-paste, no browser launched)…")
+        url = gclient.login_start()
+        self.msg_q.put(("login_url", url))
+
+    def _open_login_dialog(self, url):
+        win = tk.Toplevel(self); win.title("Google Cloud login"); win.geometry("680x300")
+        ttk.Label(win, text="1)  Copy this link, open it in ANY browser, sign in, then copy the code Google shows:",
+                  wraplength=650).pack(anchor="w", padx=12, pady=(12, 4))
+        e = ttk.Entry(win, width=100); e.pack(fill="x", padx=12); e.insert(0, url); e.configure(state="readonly")
+        ttk.Button(win, text="Copy link",
+                   command=lambda: (self.clipboard_clear(), self.clipboard_append(url),
+                                    self.log("Link copied to clipboard."))).pack(anchor="w", padx=12, pady=6)
+        ttk.Label(win, text="2)  Paste the authorization code here:").pack(anchor="w", padx=12, pady=(10, 4))
+        code = tk.StringVar()
+        ent = ttk.Entry(win, textvariable=code, width=70); ent.pack(fill="x", padx=12); ent.focus_set()
+        def submit():
+            win.destroy(); self._bg(self._login_finish, code.get())
+        ent.bind("<Return>", lambda _e: submit())
+        ttk.Button(win, text="Submit code", command=submit).pack(anchor="w", padx=12, pady=10)
+
+    def _login_finish(self, code):
+        if not code.strip():
+            return self.log("No code entered — login cancelled.")
+        acct = gclient.login_finish(code)
+        self.msg_q.put(("set", ("account", acct or "not logged in")))
+        if acct:
+            self.log(f"Logged in as {acct}. Loading projects…"); self._load_projects()
+        else:
+            self.log("Login did not complete — check the code and try again.")
+
+    def _logout(self):
+        gclient.logout(); self.msg_q.put(("set", ("account", "not logged in"))); self.log("Logged out.")
+
+    def _load_projects(self):
+        projs = gclient.list_projects()
+        self.msg_q.put(("projects", projs))
+        if projs and not self.v["project"].get():
+            self.msg_q.put(("set", ("project", projs[0])))
+        self.log(f"Found {len(projs)} project(s).")
+
+    def _list_models(self):
+        models = self._client().list_models()
+        self.msg_q.put(("models", models))
+        self.log(f"Models — text:{len(models['text'])} image:{len(models['image'])} tts:{len(models['tts'])}")
+
+    def _test_model(self, key):
+        model = self.v[key].get().strip()
+        self.log(f"Testing {model}…")
+        ok, msg = self._client().test_model(model)
+        self.log(("✓ " if ok else "✗ ") + f"{model}: {msg[:160]}")
+
+    def _test_voice(self):
+        tmp = Path(self.v["out_dir"].get()); tmp.mkdir(parents=True, exist_ok=True)
+        wav = tmp / "_voice_test.wav"
+        self.log(f"Generating voice sample ({self.v['voice'].get()})…")
+        self._client().tts_wav(self.v["tts_model"].get(), self.v["voice"].get(),
+                               "Hi! This is how this voice sounds for your narration.", wav)
+        play_wav(wav); self.log("▶ playing sample")
+
+    # ---- pipeline --------------------------------------------------------
+    def _ensure_project(self):
+        if self.project is None or str(self.project.root) != self.v["out_dir"].get():
+            self.project = Project(self.v["out_dir"].get()); self.project.load()
         return self.project
+
+    def _load_project(self):
+        self.project = None; p = self._ensure_project()
+        self.v["topic"].set(p.data.get("topic", self.v["topic"].get()))
+        self._refresh_table(); self.log(f"Loaded {p.root} ({len(p.data['scenes'])} scenes)")
 
     def _refresh_table(self):
         self.tree.delete(*self.tree.get_children())
-        if not self.project:
-            return
+        if not self.project: return
         for i, sc in enumerate(self.project.data["scenes"]):
             st = sc.setdefault("status", {})
-            vals = (i + 1, sc["narration"][:90],
-                    *(st.get(k, "—") for k in STEPS))
             statuses = [st.get(k) for k in STEPS]
-            tag = ()
-            if "failed" in statuses:
-                tag = ("failed",)
-            elif all(s == "done" for s in statuses):
-                tag = ("done",)
-            self.tree.insert("", "end", iid=str(i), values=vals, tags=tag)
-
-    def _run_bg(self, fn, *args):
-        if self.worker and self.worker.is_alive():
-            messagebox.showwarning("Busy", "A job is already running. Stop it first.")
-            return
-        self.stop_flag.clear()
-
-        def wrapper():
-            try:
-                fn(*args)
-            except Exception as e:
-                self.log(f"ERROR: {e}")
-                self.msg_q.put(("error", str(e)))
-                traceback.print_exc()
-            finally:
-                self.msg_q.put(("refresh", None))
-
-        self.worker = threading.Thread(target=wrapper, daemon=True)
-        self.worker.start()
-
-    # ---- actions ----------------------------------------------------------
-
-    def act_load(self):
-        self.project = None
-        p = self._ensure_project()
-        self.topic.set(p.data.get("topic", self.topic.get()))
-        self._refresh_table()
-        self.log(f"Loaded project: {p.root} ({len(p.data['scenes'])} scenes)")
+            tag = ("failed",) if "failed" in statuses else (("done",) if all(s == "done" for s in statuses) else ())
+            self.tree.insert("", "end", iid=str(i),
+                             values=(i + 1, sc["narration"][:90], *(st.get(k, "—") for k in STEPS)), tags=tag)
 
     def act_script(self):
-        topic = self.topic.get().strip()
-        if not topic:
-            messagebox.showwarning("Missing topic", "Enter a topic / idea first.")
-            return
-        self._run_bg(self._job_script, topic)
+        if not self.v["topic"].get().strip():
+            return messagebox.showwarning("Topic", "Enter a topic first.")
+        self._bg(self._job_script)
 
-    def _job_script(self, topic):
-        client = self._client()
-        p = self._ensure_project()
-        self.log(f"Generating script for: {topic}")
-        data = client.generate_script(self.vars["script_model"].get(), topic,
-                                      int(self.vars["num_scenes"].get()),
-                                      self.vars["style"].get())
-        p.data["topic"] = topic
-        p.data["title"] = data.get("title", topic)
-        p.data["scenes"] = [{**sc, "status": {}} for sc in data["scenes"]]
-        p.save()
-        (p.root / "script.json").write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        self.log(f"Script ready: \"{p.data['title']}\" with {len(p.data['scenes'])} scenes. Saved to script.json")
-        self.msg_q.put(("refresh", None))
+    def _job_script(self):
+        gc = self._client(); p = self._ensure_project()
+        topic = self.v["topic"].get().strip()
+        self.log(f"Generating script: {topic}")
+        data = gc.generate_script(self.v["text_model"].get(),
+                                  SCRIPT_PROMPT.format(topic=topic, n=int(self.v["scenes"].get()),
+                                                       style=self.v["style"].get()))
+        p.data.update(topic=topic, title=data.get("title", topic),
+                      scenes=[{**sc, "status": {}} for sc in data["scenes"]])
+        p.save(); self.msg_q.put(("refresh", None))
+        self.log(f"Script ready: \"{p.data['title']}\" — {len(p.data['scenes'])} scenes")
 
-    def act_step(self, step, only_indices=None, only_failed=False):
-        self._run_bg(self._job_step, step, only_indices, only_failed)
+    def act_step(self, step, only=None, only_failed=False):
+        self._bg(self._job_step, step, only, only_failed)
 
-    def _job_step(self, step, only_indices, only_failed):
-        client = self._client()
-        p = self._ensure_project()
-        scenes = p.data["scenes"]
-        if not scenes:
-            raise RuntimeError("No script yet - run step 1 first.")
+    def _job_step(self, step, only, only_failed):
+        gc = self._client(); p = self._ensure_project(); scenes = p.data["scenes"]
+        if not scenes: raise RuntimeError("No script yet — run step 1.")
         todo = []
         for i, sc in enumerate(scenes):
             st = sc.setdefault("status", {})
-            if only_indices is not None and i not in only_indices:
-                continue
-            if only_failed and st.get(step) != "failed":
-                continue
-            if only_indices is None and not only_failed and st.get(step) == "done":
-                continue
+            if only is not None and i not in only: continue
+            if only_failed and st.get(step) != "failed": continue
+            if only is None and not only_failed and st.get(step) == "done": continue
             todo.append(i)
-        if not todo:
-            self.log(f"[{step}] nothing to do (all done).")
-            return
-        self.msg_q.put(("progress", (0, len(todo))))
-        for n, i in enumerate(todo):
-            if self.stop_flag.is_set():
-                self.log("Stopped by user.")
-                return
-            sc = scenes[i]
-            paths = p.scene_paths(i)
-            sc["status"][step] = "running"
-            self.msg_q.put(("refresh", None))
-            self.log(f"[{step}] scene {i+1}/{len(scenes)} ...")
-            try:
-                if step == "image":
-                    client.generate_image(self.vars["image_model"].get(),
-                                          sc["image_prompt"], paths["image"])
-                elif step == "audio":
-                    client.generate_tts(self.vars["tts_model"].get(),
-                                        self.vars["voice"].get(),
-                                        sc["narration"], paths["audio"])
-                elif step == "video":
-                    if not paths["image"].exists():
-                        raise RuntimeError("scene image missing - generate images first")
-                    
-                    if self.vars["video_model"].get().lower() == "dola":
-                        self._generate_video_dola(sc["video_prompt"], paths["video"])
-                    else:
-                        client.generate_video(self.vars["video_model"].get(),
-                                              sc["video_prompt"], paths["image"],
-                                              self.vars["aspect_ratio"].get(),
-                                              paths["video"], log=self.log)
-                sc["status"][step] = "done"
-                self.log(f"[{step}] scene {i+1} ✓ -> {paths[step].name}")
-            except Exception as e:
-                sc["status"][step] = "failed"
-                sc.setdefault("errors", {})[step] = str(e)
-                self.log(f"[{step}] scene {i+1} ✗ {e}")
+        if not todo: return self.log(f"[{step}] nothing to do.")
+        
+        accs = self.dola_accounts_box.get("1.0", "end").strip()
+        if step == "video" and accs:
+            prompts = [scenes[i]["video_prompt"] for i in todo]
+            dests = [p.scene_paths(i)["video"] for i in todo]
+            self.log(f"[{step}] starting automated generation for {len(todo)} scenes...")
+            self._run_dola_automated(accs, prompts, dests)
+            for i in todo:
+                sc = scenes[i]
+                if p.scene_paths(i)["video"].exists():
+                    sc["status"][step] = "done"
+                else:
+                    sc["status"][step] = "failed"
             p.save()
             self.msg_q.put(("refresh", None))
-            self.msg_q.put(("progress", (n + 1, len(todo))))
+            return
+            
+        dola = self._dola_session() if step == "video" else None
+        self.msg_q.put(("progress", (0, len(todo))))
+        for n, i in enumerate(todo):
+            if self.stop_flag.is_set(): return self.log("Stopped.")
+            sc = scenes[i]; paths = p.scene_paths(i); sc["status"][step] = "running"
+            self.msg_q.put(("refresh", None)); self.log(f"[{step}] scene {i+1}/{len(scenes)}…")
+            try:
+                if step == "image":
+                    gc.generate_image(self.v["image_model"].get(), sc["image_prompt"], paths["image"])
+                elif step == "audio":
+                    gc.tts_wav(self.v["tts_model"].get(), self.v["voice"].get(), sc["narration"], paths["audio"])
+                elif step == "video":
+                    dola.generate(sc["video_prompt"], str(paths["video"]))
+                sc["status"][step] = "done"; self.log(f"[{step}] scene {i+1} ✓")
+            except Exception as e:
+                sc["status"][step] = "failed"; sc.setdefault("errors", {})[step] = str(e)
+                self.log(f"[{step}] scene {i+1} ✗ {e}")
+            p.save(); self.msg_q.put(("refresh", None)); self.msg_q.put(("progress", (n + 1, len(todo))))
         fails = sum(1 for i in todo if scenes[i]["status"].get(step) == "failed")
-        self.log(f"[{step}] finished: {len(todo)-fails} ok, {fails} failed."
-                 + (" Use '⟳ Retry Failed' to retry." if fails else ""))
+        self.log(f"[{step}] done: {len(todo)-fails} ok, {fails} failed"
+                 + (" — use Retry failed" if fails else ""))
 
-    def act_retry(self):
-        self._run_bg(self._job_retry)
+    def act_retry(self): self._bg(self._job_retry)
 
     def _job_retry(self):
         for step in STEPS:
-            if self.stop_flag.is_set():
-                return
-            self._job_step(step, None, only_failed=True)
+            if self.stop_flag.is_set(): return
+            self._job_step(step, None, True)
 
-    def act_full(self):
-        topic = self.topic.get().strip()
-        self._run_bg(self._job_full, topic)
+    def act_full(self): self._bg(self._job_full)
 
-    def _job_full(self, topic):
+    def _job_full(self):
         p = self._ensure_project()
-        if not p.data["scenes"]:
-            if not topic:
-                raise RuntimeError("Enter a topic first.")
-            self._job_script(topic)
+        if not p.data["scenes"]: self._job_script()
         for step in STEPS:
-            if self.stop_flag.is_set():
-                return
+            if self.stop_flag.is_set(): return
             self._job_step(step, None, False)
-        if self.stop_flag.is_set():
-            return
-        self._job_merge()
+        if not self.stop_flag.is_set(): self._job_merge()
 
-    def act_merge(self):
-        self._run_bg(self._job_merge)
+    def act_merge(self): self._bg(self._job_merge)
 
     def _job_merge(self):
         if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-            raise RuntimeError("ffmpeg/ffprobe not found on PATH. Install ffmpeg first "
-                               "(Windows: `winget install ffmpeg`, then restart the app).")
-        p = self._ensure_project()
-        scenes = p.data["scenes"]
-        clips = []
+            raise RuntimeError("ffmpeg/ffprobe not on PATH (Windows: winget install ffmpeg, then reopen).")
+        p = self._ensure_project(); scenes = p.data["scenes"]; clips = []
         self.msg_q.put(("progress", (0, len(scenes) + 1)))
         for i, sc in enumerate(scenes):
-            if self.stop_flag.is_set():
-                return
+            if self.stop_flag.is_set(): return
             paths = p.scene_paths(i)
             if not paths["video"].exists() or not paths["audio"].exists():
-                raise RuntimeError(f"Scene {i+1} is missing its video or audio - "
-                                   "generate/retry those steps first.")
-            self.log(f"[merge] syncing scene {i+1} video length to narration...")
-            build_scene_clip(paths["video"], paths["audio"], paths["clip"])
-            clips.append(paths["clip"])
+                raise RuntimeError(f"Scene {i+1} missing video or audio — generate those first.")
+            self.log(f"[merge] scene {i+1}: syncing video to narration…")
+            build_scene_clip(paths["video"], paths["audio"], paths["clip"]); clips.append(paths["clip"])
             self.msg_q.put(("progress", (i + 1, len(scenes) + 1)))
         final = p.root / "final.mp4"
-        self.log("[merge] concatenating all scenes...")
-        concat_clips(clips, final, p.root)
+        self.log("[merge] concatenating…"); concat_clips(clips, final, p.root)
         self.msg_q.put(("progress", (len(scenes) + 1, len(scenes) + 1)))
-        self.log(f"DONE ✔  Final video: {final}  ({media_duration(final):.1f}s)")
+        self.log(f"DONE ✔  {final}  ({media_duration(final):.1f}s)")
 
-    def _generate_video_dola(self, prompt, dest_path):
-        accounts_text = self.dola_accounts_box.get("1.0", "end").strip()
-        import asyncio
-        asyncio.run(self._async_generate_video_dola(prompt, dest_path, accounts_text))
+    def _regen(self, step):
+        sel = self.tree.selection()
+        if sel: self.act_step(step, only={int(sel[0])})
 
-    async def _async_generate_video_dola(self, prompt, dest_path, accounts_text):
-        import sys, os, shutil, random, glob
+    # ---- Dola ------------------------------------------------------------
+    def _dola_session(self):
+        if self.dola is None:
+            base = Path(self.v["dola_dir"].get() or (Path.home() / "VideoPipelineProjects" / "dola"))
+            prof = base / "_chrome_profile"
+            self.dola = DolaSession(str(prof), str(base), headless=False, log=self.log)
+        return self.dola
+
+    def _dola_login(self):
+        self.log("Opening Dola…"); self._dola_session().login()
+
+    def _dola_single(self):
+        accs = self.dola_accounts_box.get("1.0", "end").strip()
+        if accs:
+            out = Path(self.v["dola_dir"].get()); out.mkdir(parents=True, exist_ok=True)
+            dest = out / f"dola_{int(time.time())}.mp4"
+            self._bg(self._run_dola_automated, accs, [self.v["dola_prompt"].get().strip()], [dest])
+        else:
+            s = self._dola_session(); out = Path(self.v["dola_dir"].get()); out.mkdir(parents=True, exist_ok=True)
+            dest = out / f"dola_{int(time.time())}.mp4"
+            s.generate(self.v["dola_prompt"].get().strip(), str(dest))
+            self.log(f"Saved {dest}")
+
+    def _dola_batch(self):
+        prompts = [l.strip() for l in self.batch_txt.get("1.0", "end").splitlines() if l.strip()]
+        if not prompts: return self.log("No prompts.")
+        out = Path(self.v["dola_dir"].get()); out.mkdir(parents=True, exist_ok=True)
+        accs = self.dola_accounts_box.get("1.0", "end").strip()
+        if accs:
+            dests = [out / f"dola_{int(time.time())}_{n+1:02d}.mp4" for n in range(len(prompts))]
+            self._bg(self._run_dola_automated, accs, prompts, dests)
+            return
+
+        s = self._dola_session()
+        self.msg_q.put(("progress", (0, len(prompts))))
+        for n, pr in enumerate(prompts):
+            if self.stop_flag.is_set(): return self.log("Stopped.")
+            try:
+                dest = out / f"dola_{int(time.time())}_{n+1:02d}.mp4"
+                s.generate(pr, str(dest)); self.log(f"[{n+1}/{len(prompts)}] ✓ {dest.name}")
+            except Exception as e:
+                self.log(f"[{n+1}/{len(prompts)}] ✗ {e}")
+            self.msg_q.put(("progress", (n + 1, len(prompts))))
+        self.log("Batch complete.")
+
+    def _run_dola_automated(self, accounts_text, prompts, dest_paths):
         import full_lifecycle_video as flv
         from autologin import automate_google_login
         from cloakbrowser import launch_persistent_context_async
         import asyncio
 
-        accounts = []
-        for line in accounts_text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"): continue
-            parts = line.split(":")
-            if len(parts) >= 2:
-                accounts.append(parts)
+        accounts = [line.strip() for line in accounts_text.splitlines() if line.strip()]
+        if not accounts: return self.log("No valid accounts provided.")
 
-        if not accounts:
-            raise RuntimeError("No accounts provided in the UI for Dola generation.")
-        
-        acc = random.choice(accounts)
-        email, password = acc[0], acc[1]
-        totp_secret = acc[2] if len(acc) > 2 else None
-
-        self.log(f"[dola] Picked account {email} for generation.")
-
-        if not flv.ensure_socks_proxy():
-            raise RuntimeError("Cannot start SOCKS proxy for VPN routing.")
-
-        vpn_proxy = {"server": flv.SPAIN_SOCKS_PROXY}
-        session_dir = f"/home/azureuser/bulk-Video-generation/app/sessions/{email.replace('@', '_').replace('.', '_')}"
-
-        flv.cleanup_zombie_chrome(session_dir)
-        if os.path.exists(session_dir):
-            shutil.rmtree(session_dir, ignore_errors=True)
-            self.log("[dola] Cleared old session.")
-
-        vpn_ok, vpn_ip = await flv.rotate_vpn_with_retry(max_retries=3)
-        if not vpn_ok:
-            raise RuntimeError("Failed to acquire verified Spain IP.")
-
-        flv.restart_socks_proxy()
-
-        self.log("[dola] Launching CloakBrowser...")
-        ctx = await launch_persistent_context_async(
-            user_data_dir=session_dir, headless=False, proxy=vpn_proxy,
-            viewport={"width": 1280, "height": 900}, locale="en-US", humanize=True)
-        page = await ctx.new_page()
-
-        try:
-            oauth_url2 = await flv.get_google_auth_url(ctx, page)
-            if oauth_url2 == "GEO_BLOCKED" or not oauth_url2:
-                raise RuntimeError("Failed to get Google Auth URL. Geo-blocked?")
-
-            await ctx.clear_cookies()
-            self.log("[dola] Authenticating with Google...")
-            state2 = await automate_google_login(
-                oauth_url2, email, password, headless=False, proxy=vpn_proxy,
-                session_dir=session_dir, existing_ctx=ctx, existing_page=page,
-                close_on_finish=False, totp_secret=totp_secret)
-            
-            if not state2.get("login_done", False):
-                raise RuntimeError("Google login failed.")
-
-            self.log("[dola] Requesting video generation...")
-            if not flv.page_alive(page):
-                page = await ctx.new_page()
-                await page.goto("https://www.dola.com/chat/", wait_until="domcontentloaded", timeout=45000)
-                await asyncio.sleep(5)
-
-            video_result = await flv.generate_and_download_video(page, prompt)
-
-            if video_result == "SUCCESS":
-                mp4s = glob.glob(os.path.join(flv.DOWNLOAD_DIR, "*.mp4"))
-                if mp4s:
-                    video_path = max(mp4s, key=os.path.getmtime)
-                    shutil.move(video_path, str(dest_path))
-                    self.log(f"[dola] Video generated and moved to {dest_path.name}")
-                else:
-                    raise RuntimeError("Video marked SUCCESS but no mp4 found in DOWNLOAD_DIR.")
-            else:
-                raise RuntimeError(f"Dola video generation failed: {video_result}")
-
-        finally:
-            self.log("[dola] Cleaning up account...")
-            try:
-                if flv.page_alive(page):
+        async def _run():
+            self.msg_q.put(("progress", (0, len(prompts))))
+            acc_idx = 0
+            for i, (prompt, dest) in enumerate(zip(prompts, dest_paths)):
+                if self.stop_flag.is_set():
+                    self.log("Stopped."); break
+                if acc_idx >= len(accounts):
+                    self.log("Ran out of accounts!"); break
+                
+                acc = accounts[acc_idx]
+                parts = acc.split(':')
+                if len(parts) < 3:
+                    self.log(f"Invalid account format: {acc}"); acc_idx += 1; continue
+                email, pw, totp = parts[0], parts[1], parts[2]
+                
+                self.log(f"[{i+1}/{len(prompts)}] Auto-login with {email}...")
+                prof_dir = str(Path(self.v["dola_dir"].get()) / f"_prof_{email}")
+                ok = await automate_google_login(email, pw, totp, prof_dir, lambda m,t: self.log(m))
+                if not ok:
+                    self.log(f"Failed to login with {email}"); acc_idx += 1; continue
+                
+                self.log(f"[{i+1}/{len(prompts)}] Generating video...")
+                ctx = await launch_persistent_context_async(prof_dir, headless=False)
+                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                try:
+                    res = await flv.generate_and_download_video(page, prompt)
+                    if res == "SUCCESS":
+                        # Wait and find the newest mp4
+                        import glob
+                        mp4s = glob.glob(f"{prof_dir}/downloads/*.mp4")
+                        if mp4s:
+                            newest = max(mp4s, key=os.path.getctime)
+                            shutil.copy(newest, str(dest))
+                            self.log(f"[{i+1}/{len(prompts)}] ✓ {Path(dest).name}")
+                        else:
+                            self.log(f"[{i+1}/{len(prompts)}] ✗ Video generated but not found in downloads.")
+                    else:
+                        self.log(f"[{i+1}/{len(prompts)}] ✗ Generation failed: {res}")
+                except Exception as e:
+                    self.log(f"[{i+1}/{len(prompts)}] ✗ Error: {e}")
+                finally:
+                    # Always delete account
+                    self.log(f"Deleting account {email}...")
                     await flv.delete_dola_account(page)
-            except Exception as e:
-                self.log(f"[dola] Warning during account deletion: {e}")
-            try:
-                if ctx:
                     await ctx.close()
-            except Exception:
-                pass
-            flv.cleanup_zombie_chrome(session_dir)
+                
+                acc_idx += 1
+                self.msg_q.put(("progress", (i + 1, len(prompts))))
+            self.log("Automated generation complete.")
 
-    # ---- per-scene actions -------------------------------------------------
+        asyncio.run(_run())
 
-    def _selected_index(self):
-        sel = self.tree.selection()
-        return int(sel[0]) if sel else None
-
-    def _regen_selected(self, step):
-        i = self._selected_index()
-        if i is not None:
-            self.act_step(step, only_indices={i})
-
-    def _edit_selected(self):
-        i = self._selected_index()
-        if i is None or not self.project:
-            return
-        sc = self.project.data["scenes"][i]
-        win = tk.Toplevel(self)
-        win.title(f"Edit scene {i+1}")
-        win.geometry("720x520")
-        boxes = {}
-        for field in ("narration", "image_prompt", "video_prompt"):
-            ttk.Label(win, text=field).pack(anchor="w", padx=8, pady=(8, 0))
-            t = tk.Text(win, height=5, wrap="word")
-            t.pack(fill="both", expand=True, padx=8)
-            t.insert("1.0", sc.get(field, ""))
-            boxes[field] = t
-
-        def save():
-            for f, t in boxes.items():
-                new = t.get("1.0", "end").strip()
-                if new != sc.get(f):
-                    sc[f] = new
-                    # edited content invalidates the generated asset
-                    dep = {"narration": "audio", "image_prompt": "image",
-                           "video_prompt": "video"}[f]
-                    sc["status"][dep] = "—"
-            self.project.save()
-            self._refresh_table()
-            win.destroy()
-
-        ttk.Button(win, text="Save", command=save).pack(pady=8)
+    def destroy(self):
+        if self.dola:
+            try: self.dola.close()
+            except Exception: pass
+        super().destroy()
 
 
 if __name__ == "__main__":
