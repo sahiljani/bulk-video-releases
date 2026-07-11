@@ -117,7 +117,15 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"Video Pipeline Studio  v{updater.VERSION}")
-        self.geometry("1180x820"); self.minsize(1000, 680)
+        self.geometry("1200x850"); self.minsize(1050, 700)
+        
+        # Apply modern premium theme
+        try:
+            import sv_ttk
+            sv_ttk.set_theme("dark")
+        except ImportError:
+            pass
+
         self.project = None
         self.worker = None
         self.stop_flag = threading.Event()
