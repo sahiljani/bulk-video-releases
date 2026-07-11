@@ -290,8 +290,7 @@ class App(tk.Tk):
         self.after(120, self._poll)
 
     def _bg(self, fn, *args):
-        if self.worker and self.worker.is_alive():
-            messagebox.showwarning("Busy", "A job is already running."); return
+        # We allow concurrent jobs so that long-running Dola generation doesn't block the UI
         self.stop_flag.clear()
 
         def wrap():
@@ -299,7 +298,11 @@ class App(tk.Tk):
             except Exception as e:
                 self.log(f"ERROR: {e}"); self.msg_q.put(("error", str(e))); traceback.print_exc()
             finally: self.msg_q.put(("refresh", None))
-        self.worker = threading.Thread(target=wrap, daemon=True); self.worker.start()
+        
+        w = threading.Thread(target=wrap, daemon=True)
+        w.start()
+        # Keep a reference to the latest worker just in case, though it's not strictly necessary
+        self.worker = w
 
     def _browse(self):
         d = filedialog.askdirectory()
