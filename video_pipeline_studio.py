@@ -29,7 +29,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gclient
 import updater
-from dola import DolaSession
 
 STYLE_DEFAULT = "cinematic, photorealistic, dramatic lighting, high detail"
 SCRIPT_PROMPT = """You are a professional video director and screenwriter.
@@ -130,7 +129,6 @@ class App(tk.Tk):
         self.worker = None
         self.stop_flag = threading.Event()
         self.msg_q = queue.Queue()
-        self.dola = None          # shared DolaSession (opened lazily)
         self.gc = None            # gclient.Gemini once project chosen
 
         self.v = {
@@ -244,11 +242,10 @@ class App(tk.Tk):
     def _build_dola(self, pad={"padx": 6, "pady": 4}):
         f = self.tab_dola
         info = ("Dola makes the video by driving dola.com in a Chrome window. "
-                "Log in once; the session is remembered between runs.")
+                "Provide your Google accounts below. The pipeline will automatically log in, "
+                "generate the video, and delete the account for full automation.")
         ttk.Label(f, text=info, wraplength=1100, foreground="#89f").pack(anchor="w", padx=10, pady=6)
         r = ttk.Frame(f); r.pack(fill="x", padx=8)
-        ttk.Button(r, text="Open Dola & log in", command=lambda: self._bg(self._dola_login)).pack(side="left", **pad)
-        ttk.Button(r, text="I'm logged in ✓", command=lambda: self.log("Great — you can generate now.")).pack(side="left", **pad)
         ttk.Label(r, text="Save to:").pack(side="left", **pad)
         ttk.Entry(r, textvariable=self.v["dola_dir"], width=44).pack(side="left", **pad)
 
@@ -261,8 +258,8 @@ class App(tk.Tk):
         self.batch_txt.insert("1.0", "A calm sunrise over misty mountains\nWaves crashing on a rocky shore at golden hour\n")
         ttk.Button(batch, text="Generate all", command=lambda: self._bg(self._dola_batch)).pack(anchor="w", padx=6, pady=4)
 
-        acc_frame = ttk.LabelFrame(f, text="Dola Accounts (Auto-Login & Delete Flow) [Optional]"); acc_frame.pack(fill="both", expand=True, padx=8, pady=6)
-        ttk.Label(acc_frame, text="Format: email:password:totp_secret (one per line). If provided, these will be used for automated login and generation.").pack(anchor="w", padx=6, pady=2)
+        acc_frame = ttk.LabelFrame(f, text="Dola Accounts (Auto-Login & Delete Flow) [Required]"); acc_frame.pack(fill="both", expand=True, padx=8, pady=6)
+        ttk.Label(acc_frame, text="Format: email:password:totp_secret (one per line). These will be used to automatically log in and generate.").pack(anchor="w", padx=6, pady=2)
         self.dola_accounts_box = scrolledtext.ScrolledText(acc_frame, height=4, width=80)
         self.dola_accounts_box.pack(fill="both", expand=True, padx=6, pady=4)
 
@@ -457,7 +454,10 @@ class App(tk.Tk):
         if not todo: return self.log(f"[{step}] nothing to do.")
         
         accs = self.dola_accounts_box.get("1.0", "end").strip()
-        if step == "video" and accs:
+        if step == "video":
+            if not accs:
+                return messagebox.showerror("Accounts Missing", "You must provide Dola accounts in the 'Dola Video' tab to generate videos.")
+            
             prompts = [scenes[i]["video_prompt"] for i in todo]
             dests = [p.scene_paths(i)["video"] for i in todo]
             self.log(f"[{step}] starting automated generation for {len(todo)} scenes...")
@@ -472,7 +472,6 @@ class App(tk.Tk):
             self.msg_q.put(("refresh", None))
             return
             
-        dola = self._dola_session() if step == "video" else None
         self.msg_q.put(("progress", (0, len(todo))))
         for n, i in enumerate(todo):
             if self.stop_flag.is_set(): return self.log("Stopped.")
@@ -536,49 +535,24 @@ class App(tk.Tk):
         if sel: self.act_step(step, only={int(sel[0])})
 
     # ---- Dola ------------------------------------------------------------
-    def _dola_session(self):
-        if self.dola is None:
-            base = Path(self.v["dola_dir"].get() or (Path.home() / "VideoPipelineProjects" / "dola"))
-            prof = base / "_chrome_profile"
-            self.dola = DolaSession(str(prof), str(base), headless=False, log=self.log)
-        return self.dola
-
-    def _dola_login(self):
-        self.log("Opening Dola…"); self._dola_session().login()
 
     def _dola_single(self):
         accs = self.dola_accounts_box.get("1.0", "end").strip()
-        if accs:
-            out = Path(self.v["dola_dir"].get()); out.mkdir(parents=True, exist_ok=True)
-            dest = out / f"dola_{int(time.time())}.mp4"
-            self._bg(self._run_dola_automated, accs, [self.v["dola_prompt"].get().strip()], [dest])
-        else:
-            s = self._dola_session(); out = Path(self.v["dola_dir"].get()); out.mkdir(parents=True, exist_ok=True)
-            dest = out / f"dola_{int(time.time())}.mp4"
-            s.generate(self.v["dola_prompt"].get().strip(), str(dest))
-            self.log(f"Saved {dest}")
+        if not accs:
+            return messagebox.showerror("Accounts Missing", "You must provide at least one Dola account (email:pass:totp) to generate video.")
+        out = Path(self.v["dola_dir"].get()); out.mkdir(parents=True, exist_ok=True)
+        dest = out / f"dola_{int(time.time())}.mp4"
+        self._bg(self._run_dola_automated, accs, [self.v["dola_prompt"].get().strip()], [dest])
 
     def _dola_batch(self):
         prompts = [l.strip() for l in self.batch_txt.get("1.0", "end").splitlines() if l.strip()]
         if not prompts: return self.log("No prompts.")
         out = Path(self.v["dola_dir"].get()); out.mkdir(parents=True, exist_ok=True)
         accs = self.dola_accounts_box.get("1.0", "end").strip()
-        if accs:
-            dests = [out / f"dola_{int(time.time())}_{n+1:02d}.mp4" for n in range(len(prompts))]
-            self._bg(self._run_dola_automated, accs, prompts, dests)
-            return
-
-        s = self._dola_session()
-        self.msg_q.put(("progress", (0, len(prompts))))
-        for n, pr in enumerate(prompts):
-            if self.stop_flag.is_set(): return self.log("Stopped.")
-            try:
-                dest = out / f"dola_{int(time.time())}_{n+1:02d}.mp4"
-                s.generate(pr, str(dest)); self.log(f"[{n+1}/{len(prompts)}] ✓ {dest.name}")
-            except Exception as e:
-                self.log(f"[{n+1}/{len(prompts)}] ✗ {e}")
-            self.msg_q.put(("progress", (n + 1, len(prompts))))
-        self.log("Batch complete.")
+        if not accs:
+            return messagebox.showerror("Accounts Missing", "You must provide at least one Dola account (email:pass:totp) to generate video.")
+        dests = [out / f"dola_{int(time.time())}_{n+1:02d}.mp4" for n in range(len(prompts))]
+        self._bg(self._run_dola_automated, accs, prompts, dests)
 
     def _run_dola_automated(self, accounts_text, prompts, dest_paths):
         import full_lifecycle_video as flv
