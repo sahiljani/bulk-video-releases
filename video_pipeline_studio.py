@@ -583,14 +583,34 @@ class App(tk.Tk):
                 
                 self.log(f"[{i+1}/{len(prompts)}] Auto-login with {email}...")
                 prof_dir = str(Path(self.v["dola_dir"].get()) / f"_prof_{email}")
-                ok = await automate_google_login(email, pw, totp, prof_dir, lambda m,t: self.log(m))
-                if not ok:
-                    self.log(f"Failed to login with {email}"); acc_idx += 1; continue
                 
-                self.log(f"[{i+1}/{len(prompts)}] Generating video...")
+                self.log(f"[{i+1}/{len(prompts)}] Fetching Dola OAuth URL...")
                 ctx = await launch_persistent_context_async(prof_dir, headless=False)
                 page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                
                 try:
+                    oauth_url = await flv.get_google_auth_url(ctx, page)
+                    if oauth_url == "GEO_BLOCKED":
+                        self.log(f"[{i+1}/{len(prompts)}] ✗ Geo-blocked. Skipping {email}.")
+                        acc_idx += 1
+                        continue
+                        
+                    if oauth_url:
+                        ok = await automate_google_login(
+                            oauth_url, email, pw, 
+                            headless=False, 
+                            session_dir=prof_dir, 
+                            existing_ctx=ctx, 
+                            existing_page=page, 
+                            close_on_finish=False, 
+                            totp_secret=totp
+                        )
+                        if not ok:
+                            self.log(f"[{i+1}/{len(prompts)}] ✗ Failed to login with {email}"); acc_idx += 1; continue
+                    else:
+                        self.log(f"[{i+1}/{len(prompts)}] Already logged in (or no URL).")
+                    
+                    self.log(f"[{i+1}/{len(prompts)}] Generating video...")
                     res = await flv.generate_and_download_video(page, prompt)
                     if res == "SUCCESS":
                         # Wait and find the newest mp4
